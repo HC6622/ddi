@@ -1,0 +1,6 @@
+data/
+cache/
+checkpoints/
+__pycache__/
+submission.csv
+test.csv
