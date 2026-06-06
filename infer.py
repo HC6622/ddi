@@ -8,15 +8,14 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch, Data
 
-from featurize import load_caches, smiles_to_graph, TEXT_DIM
+from featurize import load_caches, smiles_to_graph, TEXT_DIM, ATOM_FEAT_DIM, BOND_FEAT_DIM
 from model import DDIModel, SEVERITY_CLASSES
 from losses import prr_from_pred
 
 
 def _safe_graph(smiles):
     g = smiles_to_graph(smiles)
-    if g is None:                       # unparseable -> 1-node zero graph so we never crash
-        from featurize import ATOM_FEAT_DIM, BOND_FEAT_DIM
+    if g is None:
         g = Data(x=torch.zeros(1, ATOM_FEAT_DIM),
                  edge_index=torch.zeros((2, 0), dtype=torch.long),
                  edge_attr=torch.zeros((0, BOND_FEAT_DIM)))
@@ -63,7 +62,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sample = pd.read_csv(args.sample)
-    columns = sample.columns.tolist()                       # canonical output order
+    columns = sample.columns.tolist()
     binary_cols = [c for c in columns if c.startswith("Target_Binary_")]
     prr_cols = [c for c in columns if c.startswith("Target_PRR_")]
 
@@ -71,16 +70,16 @@ def main():
     graphs, text_emb = load_caches()
     ds = TestDataset(test, graphs, text_emb)
     if ds.missing_graph or ds.missing_text:
-        print(f"WARNING: {ds.missing_graph} graphs / {ds.missing_text} text vectors were missing "
-              f"from cache (rebuild caches with the test file included).")
+        print(f"WARNING: {ds.missing_graph} graphs / {ds.missing_text} text vectors missing from cache.")
     ld = DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_infer)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    model = DDIModel().to(device)
+    arch = ckpt.get("arch", {})
+    model = DDIModel(**arch).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     threshold = ckpt.get("threshold", 0.3)
-    print(f"loaded checkpoint (val score {ckpt.get('score', '?')}, threshold {threshold})")
+    print(f"loaded checkpoint (val score {ckpt.get('score', '?')}, threshold {threshold}, arch {arch})")
 
     sev_idx, se_prob, prr_val = [], [], []
     with torch.no_grad():
@@ -94,15 +93,14 @@ def main():
     se_prob = torch.cat(se_prob).numpy()
     prr_val = torch.cat(prr_val).numpy()
 
-    out = pd.DataFrame({"Pair_ID": test["Pair_ID"].values})
-    out["Severity"] = [SEVERITY_CLASSES[i] for i in sev_idx]
+    data = {"Pair_ID": test["Pair_ID"].values,
+            "Severity": [SEVERITY_CLASSES[i] for i in sev_idx]}
     bin_pred = (se_prob >= threshold).astype(int)
     for j, c in enumerate(binary_cols):
-        out[c] = bin_pred[:, j]
+        data[c] = bin_pred[:, j]
     for j, c in enumerate(prr_cols):
-        out[c] = np.round(prr_val[:, j], 4)
-
-    out = out[columns]                                      # enforce exact column order
+        data[c] = np.round(prr_val[:, j], 4)
+    out = pd.DataFrame(data)[columns]
     out.to_csv(args.out, index=False)
     print(f"wrote {args.out}: {out.shape[0]} rows x {out.shape[1]} cols")
 

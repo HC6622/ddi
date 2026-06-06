@@ -82,16 +82,19 @@ def main():
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)   # L2 regularization
-    p.add_argument("--dropout", type=float, default=0.2)         # was 0.1 in the model
-    p.add_argument("--patience", type=int, default=8)            # early stopping
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--layers", type=int, default=4)
+    p.add_argument("--patience", type=int, default=8)
     p.add_argument("--subset", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("device:", device)
+    print("device:", device, "| hidden", args.hidden, "layers", args.layers,
+          "dropout", args.dropout, "wd", args.weight_decay)
 
     df = pd.read_csv("data/train.csv")
     binary_cols, prr_cols = get_label_columns(df)
@@ -107,7 +110,7 @@ def main():
     tr_ld = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_ld = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
-    model = DDIModel(dropout=args.dropout).to(device)
+    model = DDIModel(hidden=args.hidden, n_layers=args.layers, dropout=args.dropout).to(device)
     class_w = compute_class_weights(df_tr.Severity.tolist()).to(device)
     loss_fn = DDILoss(class_weights=class_w)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -132,8 +135,9 @@ def main():
               f"sPRR {r['s_prr']:.3f} @thr {r['threshold']:.2f})")
         if r["score"] > best_score:
             best_score = r["score"]; epochs_since_improve = 0
-            torch.save({"model": model.state_dict(), "threshold": r["threshold"],
-                        "score": r["score"], "dropout": args.dropout}, os.path.join(CKPT_DIR, "best.pt"))
+            torch.save({"model": model.state_dict(), "threshold": r["threshold"], "score": r["score"],
+                        "arch": {"hidden": args.hidden, "n_layers": args.layers, "dropout": args.dropout}},
+                       os.path.join(CKPT_DIR, "best.pt"))
             print(f"   saved new best -> {best_score:.4f}")
         else:
             epochs_since_improve += 1
