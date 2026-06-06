@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 from rdkit import RDLogger
+from rdkit.Chem import Descriptors, rdMolDescriptors
 from torch_geometric.data import Data
 RDLogger.DisableLog("rdApp.*")
 
@@ -16,11 +17,13 @@ TEXT_CACHE = os.path.join(CACHE_DIR, "text_emb.pt")
 TEXT_FIELDS = ["Mechanism", "Pharmacodynamics", "Metabolism", "Toxicity",
                "Indication", "Absorption", "Half_Life", "Protein_Binding",
                "Elimination_Route", "Warning", "CYP450_Enzymes"]
-TEXT_MODEL = "all-MiniLM-L6-v2"      # 384-dim, fast, runs on CPU/MPS
+TEXT_MODEL = "all-MiniLM-L6-v2"
 
 ATOM_FEAT_DIM = 34
 BOND_FEAT_DIM = 6
-TEXT_DIM = 384
+N_DESC = 9
+EMB_DIM = 384
+TEXT_DIM = EMB_DIM + N_DESC            # 384 text + 9 descriptors = 393
 
 ATOMS = ["C", "N", "O", "S", "F", "Cl", "Br", "P", "I", "B", "Si"]
 HYBRID = [Chem.HybridizationType.SP, Chem.HybridizationType.SP2,
@@ -30,31 +33,28 @@ HYBRID = [Chem.HybridizationType.SP, Chem.HybridizationType.SP2,
 
 def _one_hot(value, choices):
     vec = [int(value == c) for c in choices]
-    vec.append(int(value not in choices))      # final slot = "other"
+    vec.append(int(value not in choices))
     return vec
 
 
 def atom_features(atom):
     return (
-        _one_hot(atom.GetSymbol(), ATOMS) +                # 12
-        _one_hot(atom.GetDegree(), [0, 1, 2, 3, 4, 5]) +   # 7
-        _one_hot(atom.GetTotalNumHs(), [0, 1, 2, 3, 4]) +  # 6
-        _one_hot(atom.GetHybridization(), HYBRID) +        # 6
-        [atom.GetFormalCharge(),                           # 1
-         int(atom.GetIsAromatic()),                        # 1
-         int(atom.IsInRing())]                             # 1
-    )                                                      # = 34
+        _one_hot(atom.GetSymbol(), ATOMS) +
+        _one_hot(atom.GetDegree(), [0, 1, 2, 3, 4, 5]) +
+        _one_hot(atom.GetTotalNumHs(), [0, 1, 2, 3, 4]) +
+        _one_hot(atom.GetHybridization(), HYBRID) +
+        [atom.GetFormalCharge(), int(atom.GetIsAromatic()), int(atom.IsInRing())]
+    )
 
 
 def bond_features(bond):
     bt = bond.GetBondType()
     return [int(bt == Chem.BondType.SINGLE), int(bt == Chem.BondType.DOUBLE),
             int(bt == Chem.BondType.TRIPLE), int(bt == Chem.BondType.AROMATIC),
-            int(bond.GetIsConjugated()), int(bond.IsInRing())]   # = 6
+            int(bond.GetIsConjugated()), int(bond.IsInRing())]
 
 
 def smiles_to_graph(smiles):
-    """Return a PyG Data graph for one molecule (None-safe)."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None or mol.GetNumAtoms() == 0:
         return None
@@ -73,8 +73,18 @@ def smiles_to_graph(smiles):
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
+def mol_descriptors(smiles):
+    """9 whole-molecule properties (scaffold-independent, good for cold-start)."""
+    m = Chem.MolFromSmiles(smiles)
+    if m is None:
+        return [0.0] * N_DESC
+    return [Descriptors.MolWt(m), Descriptors.MolLogP(m), Descriptors.TPSA(m),
+            Descriptors.NumHDonors(m), Descriptors.NumHAcceptors(m),
+            Descriptors.NumRotatableBonds(m), rdMolDescriptors.CalcNumAromaticRings(m),
+            rdMolDescriptors.CalcFractionCSP3(m), rdMolDescriptors.CalcNumRings(m)]
+
+
 def build_drug_text_map(df):
-    """Map each unique SMILES -> one combined text string, from both A and B sides."""
     text = {}
     for side in ["A", "B"]:
         cols = [f"{f}_{side}" for f in TEXT_FIELDS]
@@ -88,7 +98,6 @@ def build_drug_text_map(df):
 
 
 def build_caches(data_path="data/train.csv", extra_paths=()):
-    """Build + save graph and text caches for every unique drug. Run once."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     frames = [pd.read_csv(data_path)] + [pd.read_csv(p) for p in extra_paths]
     df = pd.concat(frames, ignore_index=True)
@@ -106,12 +115,17 @@ def build_caches(data_path="data/train.csv", extra_paths=()):
     from sentence_transformers import SentenceTransformer
     text_map = build_drug_text_map(df)
     smis = list(text_map.keys())
-    model = SentenceTransformer(TEXT_MODEL)        # downloads ~80MB on first run
+    model = SentenceTransformer(TEXT_MODEL)
     emb = model.encode([text_map[s] for s in smis], batch_size=32,
-                       show_progress_bar=True, convert_to_numpy=True)
-    text_emb = {s: e.astype(np.float32) for s, e in zip(smis, emb)}
+                       show_progress_bar=True, convert_to_numpy=True)        # [N, 384]
+
+    desc = np.array([mol_descriptors(s) for s in smis], dtype=np.float32)    # [N, 9]
+    desc = (desc - desc.mean(0)) / (desc.std(0) + 1e-6)                       # standardize
+
+    combined = np.concatenate([emb, desc], axis=1).astype(np.float32)        # [N, 393]
+    text_emb = {s: combined[i] for i, s in enumerate(smis)}
     torch.save(text_emb, TEXT_CACHE)
-    print(f"saved {len(text_emb)} text embeddings (dim {emb.shape[1]}) -> {TEXT_CACHE}")
+    print(f"saved {len(text_emb)} drug vectors (dim {combined.shape[1]}: 384 text + 9 descriptors) -> {TEXT_CACHE}")
 
 
 def load_caches():
