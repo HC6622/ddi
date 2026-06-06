@@ -15,7 +15,7 @@ from losses import DDILoss, compute_class_weights, prr_from_pred
 from metrics import compute_score
 
 CKPT_DIR = "checkpoints"
-SE_THRESHOLDS = np.arange(0.10, 0.65, 0.05)     # swept on val to pick best micro-F1
+SE_THRESHOLDS = np.arange(0.10, 0.65, 0.05)
 
 
 class PairDataset(Dataset):
@@ -79,15 +79,18 @@ def evaluate(model, loader, df_val, binary_cols, prr_cols, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--subset", type=int, default=0, help="limit train pairs (0 = all) for quick local runs")
+    p.add_argument("--weight-decay", type=float, default=1e-4)   # L2 regularization
+    p.add_argument("--dropout", type=float, default=0.2)         # was 0.1 in the model
+    p.add_argument("--patience", type=int, default=8)            # early stopping
+    p.add_argument("--subset", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"   # MPS skipped: PyG op support
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device:", device)
 
     df = pd.read_csv("data/train.csv")
@@ -104,16 +107,17 @@ def main():
     tr_ld = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_ld = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
-    model = DDIModel().to(device)
+    model = DDIModel(dropout=args.dropout).to(device)
     class_w = compute_class_weights(df_tr.Severity.tolist()).to(device)
     loss_fn = DDILoss(class_weights=class_w)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
 
     os.makedirs(CKPT_DIR, exist_ok=True)
     best_score = -1.0
+    epochs_since_improve = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running = {"sev": 0, "se": 0, "prr": 0}; n = 0
         for da, db, ta, tb, sev, se, prr in tr_ld:
             da, db, ta, tb = da.to(device), db.to(device), ta.to(device), tb.to(device)
             sev, se, prr = sev.to(device), se.to(device), prr.to(device)
@@ -121,18 +125,21 @@ def main():
             sl, el, po = model(da, db, ta, tb)
             total, parts = loss_fn(sl, el, po, sev, se, prr)
             total.backward(); opt.step()
-            for k in running: running[k] += parts[k]
-            n += 1
         r = evaluate(model, val_ld, df_val, binary_cols, prr_cols, device)
-        print(f"epoch {epoch:2d} | train[sev {running['sev']/n:.3f} se {running['se']/n:.3f} "
-              f"prr {running['prr']/n:.3f}] | val SCORE {r['score']:.4f} "
+        sched.step(r["score"])
+        print(f"epoch {epoch:2d} | lr {opt.param_groups[0]['lr']:.1e} | val SCORE {r['score']:.4f} "
               f"(sevF1 {r['f1_severity']:.3f} seF1 {r['f1_sideeffects']:.3f} "
               f"sPRR {r['s_prr']:.3f} @thr {r['threshold']:.2f})")
         if r["score"] > best_score:
-            best_score = r["score"]
+            best_score = r["score"]; epochs_since_improve = 0
             torch.save({"model": model.state_dict(), "threshold": r["threshold"],
-                        "score": r["score"]}, os.path.join(CKPT_DIR, "best.pt"))
+                        "score": r["score"], "dropout": args.dropout}, os.path.join(CKPT_DIR, "best.pt"))
             print(f"   saved new best -> {best_score:.4f}")
+        else:
+            epochs_since_improve += 1
+            if epochs_since_improve >= args.patience:
+                print(f"   no improvement in {args.patience} epochs -> early stop")
+                break
     print("done. best val score:", round(best_score, 4))
 
 
